@@ -1,1 +1,6 @@
-id,name,category_id\n1,Laptop,101\n2,Mouse,102\n3,Keyboard,102\n4,Monitor,101\n5,Headphones,103
+id,name,category_id
+1,Laptop,101
+2,Mouse,102
+3,Keyboard,102
+4,Monitor,101
+5,Headphones,103

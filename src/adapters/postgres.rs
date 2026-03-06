@@ -7,6 +7,7 @@ use datafusion::prelude::*;
 use sqlx::{postgres::PgPoolOptions, Row};
 use std::sync::Arc;
 
+/// Connect to Postgres and register tables (used on initial startup)
 pub async fn register(ctx: &SessionContext) -> Result<()> {
     println!("🔌 Registering PostgreSQL Adapter (V2 In-Memory)...");
 
@@ -16,108 +17,164 @@ pub async fn register(ctx: &SessionContext) -> Result<()> {
         .await
         .expect("Failed to connect to Postgres");
 
-    // Table 1: orders
-    register_table(ctx, &pool, "orders", "SELECT id, user_id, amount, product FROM orders", Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("user_id", DataType::Int32, false),
-        Field::new("amount", DataType::Float64, false),
-        Field::new("product", DataType::Utf8, false),
-    ]))).await?;
+    register_with_pool(ctx, &pool).await
+}
 
-    // Table 2: customers
-    register_table(ctx, &pool, "customers", "SELECT id, name, email FROM customers", Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("email", DataType::Utf8, false),
-    ]))).await?;
+/// Register Postgres tables using an existing pool (used during reload)
+pub async fn register_with_pool(ctx: &SessionContext, pool: &sqlx::PgPool) -> Result<()> {
+    // Discover tables dynamically from the database
+    let table_rows = sqlx::query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
-    // Table 3: reviews
-    register_table(ctx, &pool, "reviews", "SELECT id, order_id, rating, comment FROM reviews", Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("order_id", DataType::Int32, false),
-        Field::new("rating", DataType::Int32, false),
-        Field::new("comment", DataType::Utf8, false),
-    ]))).await?;
+    for table_row in table_rows {
+        let table_name: String = table_row.get(0);
+
+        // Discover columns for this table
+        let col_rows = sqlx::query(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position"
+        )
+        .bind(&table_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        let mut fields = Vec::new();
+        let mut col_names = Vec::new();
+        let mut col_types = Vec::new();
+
+        for col_row in &col_rows {
+            let col_name: String = col_row.get(0);
+            let data_type: String = col_row.get(1);
+
+            let arrow_type = pg_type_to_arrow(&data_type);
+            fields.push(Field::new(&col_name, arrow_type.clone(), true));
+            col_names.push(col_name);
+            col_types.push(data_type);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+
+        // Fetch all rows
+        let query_str = format!("SELECT {} FROM {}", 
+            col_names.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
+            table_name
+        );
+        let rows = sqlx::query(&query_str)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        // Build arrays dynamically based on column types
+        let mut builders: Vec<ColumnBuilder> = col_types.iter().map(|t| match pg_type_to_arrow(t) {
+            DataType::Int32 => ColumnBuilder::Int32(Int32Builder::new()),
+            DataType::Float64 => ColumnBuilder::Float64(Float64Builder::new()),
+            _ => ColumnBuilder::Utf8(StringBuilder::new()),
+        }).collect();
+
+        for row in &rows {
+            for (i, col_type) in col_types.iter().enumerate() {
+                match &mut builders[i] {
+                    ColumnBuilder::Int32(b) => {
+                        let val: Option<i32> = row.try_get(i).ok();
+                        match val {
+                            Some(v) => b.append_value(v),
+                            None => b.append_null(),
+                        }
+                    }
+                    ColumnBuilder::Float64(b) => {
+                        // Handle both FLOAT8 and NUMERIC types
+                        if col_type == "numeric" {
+                            let val: Option<rust_decimal::Decimal> = row.try_get(i).ok();
+                            match val {
+                                Some(v) => b.append_value(v.to_string().parse().unwrap_or(0.0)),
+                                None => b.append_null(),
+                            }
+                        } else {
+                            let val: Option<f64> = row.try_get(i).ok();
+                            match val {
+                                Some(v) => b.append_value(v),
+                                None => b.append_null(),
+                            }
+                        }
+                    }
+                    ColumnBuilder::Utf8(b) => {
+                        let val: Option<String> = row.try_get(i).ok();
+                        match val {
+                            Some(v) => b.append_value(v),
+                            None => b.append_null(),
+                        }
+                    }
+                }
+            }
+        }
+
+        let arrays: Vec<Arc<dyn datafusion::arrow::array::Array>> = builders.into_iter().map(|b| match b {
+            ColumnBuilder::Int32(mut b) => Arc::new(b.finish()) as Arc<dyn datafusion::arrow::array::Array>,
+            ColumnBuilder::Float64(mut b) => Arc::new(b.finish()) as Arc<dyn datafusion::arrow::array::Array>,
+            ColumnBuilder::Utf8(mut b) => Arc::new(b.finish()) as Arc<dyn datafusion::arrow::array::Array>,
+        }).collect();
+
+        let batch = RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table(&table_name, Arc::new(mem_table))?;
+        println!("  -> Registered PG Table: {}", table_name);
+    }
 
     println!("✅ All PostgreSQL tables loaded into memory.");
     Ok(())
 }
 
-async fn register_table(
-    ctx: &SessionContext, 
-    pool: &sqlx::PgPool, 
-    table_name: &str, 
-    query: &str, 
-    schema: Arc<Schema>
-) -> Result<()> {
-    let rows = sqlx::query(query)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+/// Run a SQL init script against Postgres (drop + recreate)
+pub async fn run_init_sql(pool: &sqlx::PgPool, sql: &str) -> std::result::Result<(), String> {
+    // First, drop all existing tables in public schema
+    let drop_rows = sqlx::query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to list tables: {}", e))?;
 
-    let mut id_builder = Int32Builder::new();
-    let mut col1_builder = Int32Builder::new(); // Used for user_id or product_id
-    let mut float_builder = Float64Builder::new(); // Used for amount
-    let mut string_builder = StringBuilder::new(); // Used for product, name, email, comment
-    let mut rating_builder = Int32Builder::new(); // Used for rating
-
-    let mut batches_vec = Vec::new();
-
-    // Note: Since schemas vary, we'll use a more generic approach or match per table
-    // For this project V2, we'll keep it specific to our 3 tables for clarity
-    match table_name {
-        "orders" => {
-            let mut u_id = Int32Builder::new();
-            let mut amt = Float64Builder::new();
-            let mut prod = StringBuilder::new();
-            let mut ids = Int32Builder::new();
-            for row in rows {
-                ids.append_value(row.get(0));
-                u_id.append_value(row.get(1));
-                let amount: rust_decimal::Decimal = row.get(2);
-                amt.append_value(amount.to_string().parse().unwrap_or(0.0));
-                prod.append_value(row.get::<String, _>(3));
-            }
-            let batch = RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(ids.finish()), Arc::new(u_id.finish()), Arc::new(amt.finish()), Arc::new(prod.finish())
-            ]).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-            batches_vec.push(batch);
-        },
-        "customers" => {
-            let mut ids = Int32Builder::new();
-            let mut names = StringBuilder::new();
-            let mut emails = StringBuilder::new();
-            for row in rows {
-                ids.append_value(row.get(0));
-                names.append_value(row.get::<String, _>(1));
-                emails.append_value(row.get::<String, _>(2));
-            }
-            let batch = RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(ids.finish()), Arc::new(names.finish()), Arc::new(emails.finish())
-            ]).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-            batches_vec.push(batch);
-        },
-        "reviews" => {
-            let mut ids = Int32Builder::new();
-            let mut p_ids = Int32Builder::new();
-            let mut rats = Int32Builder::new();
-            let mut comms = StringBuilder::new();
-            for row in rows {
-                ids.append_value(row.get(0));
-                p_ids.append_value(row.get(1));
-                rats.append_value(row.get(2));
-                comms.append_value(row.get::<String, _>(3));
-            }
-            let batch = RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(ids.finish()), Arc::new(p_ids.finish()), Arc::new(rats.finish()), Arc::new(comms.finish())
-            ]).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-            batches_vec.push(batch);
-        },
-        _ => {}
+    for row in drop_rows {
+        let table_name: String = row.get(0);
+        let drop_sql = format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table_name);
+        sqlx::query(&drop_sql)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to drop table {}: {}", table_name, e))?;
     }
 
-    let mem_table = MemTable::try_new(schema, vec![batches_vec])?;
-    ctx.register_table(table_name, Arc::new(mem_table))?;
-    println!("  -> Registered PG Table: {}", table_name);
+    // Execute the init SQL by splitting on semicolon
+    for stmt in sql.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() { continue; }
+        sqlx::query(stmt)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to execute init SQL statement '{}': {}", stmt, e))?;
+    }
+
+    println!("  ✅ PostgreSQL re-initialized.");
     Ok(())
+}
+
+enum ColumnBuilder {
+    Int32(Int32Builder),
+    Float64(Float64Builder),
+    Utf8(StringBuilder),
+}
+
+fn pg_type_to_arrow(pg_type: &str) -> DataType {
+    match pg_type {
+        "integer" | "int4" | "smallint" | "int2" => DataType::Int32,
+        "bigint" | "int8" => DataType::Int64,
+        "real" | "float4" => DataType::Float32,
+        "double precision" | "float8" | "numeric" => DataType::Float64,
+        _ => DataType::Utf8,
+    }
 }

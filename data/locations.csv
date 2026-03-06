@@ -1,1 +1,6 @@
-id,city,region\n1,Mumbai,West\n2,Delhi,North\n3,Bangalore,South\n4,Chennai,South\n5,Kolkata,East
+id,city,region
+1,Mumbai,West
+2,Delhi,North
+3,Bangalore,South
+4,Chennai,South
+5,Kolkata,East

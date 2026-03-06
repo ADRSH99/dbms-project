@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, post},
+    routing::{get, post, delete},
     Json, Router,
     extract::State,
     response::Html,
@@ -7,13 +7,18 @@ use axum::{
 use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
+use sqlx::postgres::PgPoolOptions;
+use mongodb::{Client, options::ClientOptions};
 
 mod adapters;
 
 #[derive(Clone)]
-struct AppState {
-    ctx: Arc<SessionContext>,
+pub struct AppState {
+    pub ctx: Arc<RwLock<SessionContext>>,
+    pub pg_pool: sqlx::PgPool,
+    pub mongo_db: mongodb::Database,
 }
 
 #[derive(Deserialize)]
@@ -33,7 +38,7 @@ async fn main() -> datafusion::error::Result<()> {
     println!("❄️ IceWeave Federated Query Engine V2 Initializing...");
 
     // 1. Initialize DataFusion
-    let ctx = Arc::new(SessionContext::new());
+    let ctx = SessionContext::new();
 
     // 2. Register all adapters (Fetches data into memory)
     adapters::register_all(&ctx).await?;
@@ -54,12 +59,37 @@ async fn main() -> datafusion::error::Result<()> {
 
     println!("✅ All sources registered.");
 
-    // 4. Set up the Web Server
-    let state = AppState { ctx };
+    // 4. Create persistent DB connections for reload
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect("postgres://postgres:postgres@localhost:5432/iceweave")
+        .await
+        .expect("Failed to create persistent PG pool");
+
+    let mongo_options = ClientOptions::parse("mongodb://localhost:27017")
+        .await
+        .expect("Failed to parse MongoDB connection string");
+    let mongo_client = Client::with_options(mongo_options)
+        .expect("Failed to create MongoDB client");
+    let mongo_db = mongo_client.database("iceweave");
+
+    // 5. Set up the Web Server
+    let state = AppState {
+        ctx: Arc::new(RwLock::new(ctx)),
+        pg_pool,
+        mongo_db,
+    };
 
     let app = Router::new()
         .route("/", get(ui))
         .route("/query", post(run_query))
+        // REST API routes (in rest.rs)
+        .route("/sources", get(adapters::rest::list_sources))
+        .route("/upload/postgres", post(adapters::rest::upload_postgres))
+        .route("/upload/mongo", post(adapters::rest::upload_mongo))
+        .route("/upload/csv", post(adapters::rest::upload_csv))
+        .route("/csv/{name}", delete(adapters::rest::delete_csv))
+        .route("/reload", post(adapters::rest::reload_engine))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -81,7 +111,9 @@ async fn run_query(
 ) -> Json<QueryResponse> {
     println!("🔍 Executing SQL: {}", payload.sql);
     
-    let df = match state.ctx.sql(&payload.sql).await {
+    let ctx = state.ctx.read().await;
+
+    let df = match ctx.sql(&payload.sql).await {
         Ok(df) => df,
         Err(e) => return Json(QueryResponse {
             columns: vec![],

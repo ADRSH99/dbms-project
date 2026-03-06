@@ -1,1 +1,6 @@
-id,name,age,city_id\n1,Alice,30,1\n2,Bob,25,3\n3,Charlie,35,2\n4,David,28,4\n5,Eve,32,5
+id,name,age,city_id
+1,Alice,30,1
+2,Bob,25,3
+3,Charlie,35,2
+4,David,28,4
+5,Eve,32,5

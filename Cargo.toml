@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 arrow = "58.0.0"
 async-trait = "0.1.89"
-axum = "0.8.8"
+axum = { version = "0.8.8", features = ["multipart"] }
 datafusion = "52.2.0"
 futures = "0.3.32"
 futures-util = "0.3.32"

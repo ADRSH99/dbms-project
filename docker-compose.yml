@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: iceweave-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: iceweave
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-scripts/postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mongo:
+    image: mongo:6
+    container_name: iceweave-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./init-scripts/mongo.js:/docker-entrypoint-initdb.d/init.js
